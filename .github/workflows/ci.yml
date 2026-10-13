@@ -30,7 +30,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -70,7 +70,7 @@ jobs:
     name: Android (unit tests, lint, build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-java@v4
         with:
@@ -100,7 +100,7 @@ jobs:
     name: Secret scan (the service_role key must never be committed)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2
