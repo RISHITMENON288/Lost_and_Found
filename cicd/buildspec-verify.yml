@@ -1,12 +1,17 @@
 version: 0.2
-# Post-deploy stage: installs the matching model, then checks the live API is up and protected.
+# Post-deploy stage: installs the matching model (if it is in the repo), then checks the live API is up and protected.
 phases:
   build:
     commands:
       - >
         DATA_BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK"
         --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text)
-      - aws s3 cp ml/out/weights_aws.json "s3://${DATA_BUCKET}/models/weights.json"
+      - |
+        if [ -f ml/out/weights_aws.json ]; then
+          aws s3 cp ml/out/weights_aws.json "s3://${DATA_BUCKET}/models/weights.json"
+        else
+          echo "ml/out/weights_aws.json is not in the repo - keeping the model already stored in S3"
+        fi
       - >
         API=$(aws cloudformation describe-stacks --stack-name "$STACK"
         --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
