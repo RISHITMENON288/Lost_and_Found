@@ -1,0 +1,7 @@
+boto3>=1.35
+moto[dynamodb,s3,sqs]>=5.0
+PyYAML>=6.0
+ruff>=0.6
+cfn-lint>=1.0
+bandit>=1.7
+pip-audit>=2.7

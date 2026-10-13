@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Camera photos are written to the app's private cache folder and shared only with the camera app. -->
+<paths>
+    <cache-path name="camera" path="camera/" />
+</paths>

@@ -1,0 +1,822 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Campus Lost & Found backend (Cognito, HTTP API, Lambda, DynamoDB, S3, SQS, Rekognition, SES, EventBridge, CloudWatch)
+
+# Deploy with deploy.sh / deploy.ps1 (they run `aws cloudformation package` first so ./src is uploaded).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: campus-lost-found
+    AllowedPattern: "[a-z0-9-]{3,30}"
+  BudgetEmail:
+    Type: String
+    Description: Receives cost and alarm emails (SNS will ask you to confirm the subscription).
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
+    MinValue: 1
+  AllowedEmailDomain:
+    Type: String
+    Default: ""
+    Description: Optional, e.g. vitstudent.ac.in. Only this email domain may register. Empty allows any.
+  ExtractorImageUri:
+    Type: String
+    Default: ""
+    Description: Optional ECR image URI of the CLIP extractor (see ml/README.md). Empty disables image similarity.
+  SenderEmail:
+    Type: String
+    Default: ""
+    Description: Optional. A sender address verified in Amazon SES. Empty turns match emails off.
+  ExpiryDays:
+    Type: Number
+    Default: 60
+    MinValue: 7
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+
+Conditions:
+  HasExtractor: !Not [!Equals [!Ref ExtractorImageUri, ""]]
+  HasSender: !Not [!Equals [!Ref SenderEmail, ""]]
+
+Resources:
+  # ------------------------------------------------------------------ Storage
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Sub "${Bucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: itemId, AttributeType: S }
+        - { AttributeName: type, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: N }
+        - { AttributeName: reporterId, AttributeType: S }
+        - { AttributeName: category, AttributeType: S }
+      KeySchema:
+        - { AttributeName: itemId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: ByType
+          KeySchema:
+            - { AttributeName: type, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [category, status, title, description, location, occurredAt, imageKey, reporterId, reporterName]
+        - IndexName: ByReporter
+          KeySchema:
+            - { AttributeName: reporterId, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [type, category, status, title, description, location, occurredAt, imageKey, reporterName]
+        - IndexName: ByCategory
+          KeySchema:
+            - { AttributeName: category, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection:
+            ProjectionType: ALL
+
+  MatchesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: matchId, AttributeType: S }
+        - { AttributeName: lostReporterId, AttributeType: S }
+        - { AttributeName: foundReporterId, AttributeType: S }
+        - { AttributeName: lostItemId, AttributeType: S }
+        - { AttributeName: foundItemId, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: N }
+      KeySchema:
+        - { AttributeName: matchId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: ByLostReporter
+          KeySchema:
+            - { AttributeName: lostReporterId, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: ByFoundReporter
+          KeySchema:
+            - { AttributeName: foundReporterId, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: ByLostItem
+          KeySchema:
+            - { AttributeName: lostItemId, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+        - IndexName: ByFoundItem
+          KeySchema:
+            - { AttributeName: foundItemId, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+
+  # ------------------------------------------------------------------ Queues
+  MatchDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  MatchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 360 # >= 6x the worker timeout, as AWS recommends
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MatchDLQ.Arn
+        maxReceiveCount: 3
+
+  ExtractDLQ:
+    Type: AWS::SQS::Queue
+    Condition: HasExtractor
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  ExtractQueue:
+    Type: AWS::SQS::Queue
+    Condition: HasExtractor
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 720
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ExtractDLQ.Arn
+        maxReceiveCount: 3
+
+  # ------------------------------------------------------------------ Auth
+  PreSignUpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-pre-signup"
+      RetentionInDays: !Ref LogRetentionDays
+
+  PreSignUpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${PreSignUpLogGroup.Arn}:*"
+
+  PreSignUpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-pre-signup"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: lf.pre_signup.lambda_handler
+      Code: ./src
+      Role: !GetAtt PreSignUpRole.Arn
+      MemorySize: 128
+      Timeout: 5
+      Environment:
+        Variables:
+          ALLOWED_EMAIL_DOMAIN: !Ref AllowedEmailDomain
+      LoggingConfig:
+        LogGroup: !Ref PreSignUpLogGroup
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-users"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: "OFF"
+      Schema:
+        - { Name: email, Required: true, Mutable: true, AttributeDataType: String }
+        - { Name: name, Required: true, Mutable: true, AttributeDataType: String }
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpFunction.Arn
+
+  PreSignUpPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PreSignUpFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${ProjectName}-android"
+      GenerateSecret: false # mobile apps cannot keep a secret
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        IdToken: minutes
+        AccessToken: minutes
+        RefreshToken: days
+
+  # ------------------------------------------------------------------ API
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-api"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-access"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }
+      Policies:
+        - PolicyName: api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ApiLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:BatchGetItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt ItemsTable.Arn
+                  - !Sub "${ItemsTable.Arn}/index/*"
+                  - !GetAtt MatchesTable.Arn
+                  - !Sub "${MatchesTable.Arn}/index/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub "${Bucket.Arn}/uploads/*"
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt MatchQueue.Arn
+              - !If
+                - HasExtractor
+                - Effect: Allow
+                  Action: sqs:SendMessage
+                  Resource: !GetAtt ExtractQueue.Arn
+                - !Ref AWS::NoValue
+              - !If
+                - HasSender
+                - Effect: Allow
+                  Action: ses:SendEmail
+                  Resource: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+                - !Ref AWS::NoValue
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: lf.api.lambda_handler
+      Code: ./src
+      Role: !GetAtt ApiRole.Arn
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          ITEMS_TABLE: !Ref ItemsTable
+          MATCHES_TABLE: !Ref MatchesTable
+          BUCKET: !Ref Bucket
+          MATCH_QUEUE_URL: !Ref MatchQueue
+          EXTRACT_QUEUE_URL: !If [HasExtractor, !Ref ExtractQueue, ""]
+          SENDER_EMAIL: !Ref SenderEmail
+      LoggingConfig:
+        LogGroup: !Ref ApiLogGroup
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      ProtocolType: HTTP
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: cognito
+      AuthorizerType: JWT
+      IdentitySource: ["$request.header.Authorization"]
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClient]
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  RouteListItems:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /items"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteCreateItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /items"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteGetItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /items/{id}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteCloseItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /items/{id}/close"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteReturnItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /items/{id}/return"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteListMatches:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /matches"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteContact:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /matches/{id}/contact"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteRespondMatch:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /matches/{id}/respond"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteUpload:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /uploads"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20 # protects the free tier from runaway clients
+        ThrottlingRateLimit: 10
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","route":"$context.routeKey","status":"$context.status","latency":"$context.responseLatency"}'
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  # ------------------------------------------------------------------ Matching worker
+  MatchWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-match-worker"
+      RetentionInDays: !Ref LogRetentionDays
+
+  MatchWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }
+      Policies:
+        - PolicyName: worker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${MatchWorkerLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt ItemsTable.Arn
+                  - !Sub "${ItemsTable.Arn}/index/*"
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt MatchesTable.Arn
+                  - !Sub "${MatchesTable.Arn}/index/*"
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "${Bucket.Arn}/models/*"
+                  - !Sub "${Bucket.Arn}/uploads/*" # Rekognition reads the photo with this role's permission
+              - Effect: Allow
+                Action: rekognition:DetectLabels
+                Resource: "*" # this action does not support resource-level permissions
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt MatchQueue.Arn
+              - !If
+                - HasSender
+                - Effect: Allow
+                  Action: ses:SendEmail
+                  Resource: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+                - !Ref AWS::NoValue
+
+  MatchWorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-match-worker"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: lf.match_worker.lambda_handler
+      Code: ./src
+      Role: !GetAtt MatchWorkerRole.Arn
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          ITEMS_TABLE: !Ref ItemsTable
+          MATCHES_TABLE: !Ref MatchesTable
+          BUCKET: !Ref Bucket
+          MATCH_QUEUE_URL: !Ref MatchQueue
+          SENDER_EMAIL: !Ref SenderEmail
+      LoggingConfig:
+        LogGroup: !Ref MatchWorkerLogGroup
+
+  MatchWorkerMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt MatchQueue.Arn
+      FunctionName: !Ref MatchWorkerFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 2
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: 2 # caps cost and DynamoDB pressure
+
+  # ------------------------------------------------------------------ Scheduled expiry (EventBridge)
+  ExpiryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-expiry"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ExpiryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }
+      Policies:
+        - PolicyName: expiry
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ExpiryLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt ItemsTable.Arn
+                  - !Sub "${ItemsTable.Arn}/index/*"
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt MatchesTable.Arn
+                  - !Sub "${MatchesTable.Arn}/index/*"
+
+  ExpiryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-expiry"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: lf.expiry.lambda_handler
+      Code: ./src
+      Role: !GetAtt ExpiryRole.Arn
+      MemorySize: 256
+      Timeout: 120
+      Environment:
+        Variables:
+          ITEMS_TABLE: !Ref ItemsTable
+          MATCHES_TABLE: !Ref MatchesTable
+          BUCKET: !Ref Bucket
+          EXPIRY_DAYS: !Ref ExpiryDays
+      LoggingConfig:
+        LogGroup: !Ref ExpiryLogGroup
+
+  ExpiryRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Daily housekeeping, closes reports older than ExpiryDays
+      ScheduleExpression: "cron(30 20 * * ? *)" # 02:00 IST
+      State: ENABLED
+      Targets:
+        - Id: expiry
+          Arn: !GetAtt ExpiryFunction.Arn
+
+  ExpiryPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ExpiryFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ExpiryRule.Arn
+
+  # ------------------------------------------------------------------ Optional image feature extractor (container Lambda)
+  ExtractorRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-extractor"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 3","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}'
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: LambdaPull
+            Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+            Condition:
+              StringLike:
+                "aws:sourceArn": !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+
+  ExtractorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasExtractor
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-extractor"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ExtractorRole:
+    Type: AWS::IAM::Role
+    Condition: HasExtractor
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }
+      Policies:
+        - PolicyName: extractor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ExtractorLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt ItemsTable.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${Bucket.Arn}/uploads/*"
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt ExtractQueue.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt MatchQueue.Arn
+
+  ExtractorFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasExtractor
+    Properties:
+      FunctionName: !Sub "${ProjectName}-extractor"
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ExtractorImageUri
+      Role: !GetAtt ExtractorRole.Arn
+      MemorySize: 3008
+      Timeout: 120
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          ITEMS_TABLE: !Ref ItemsTable
+          BUCKET: !Ref Bucket
+          MATCH_QUEUE_URL: !Ref MatchQueue
+      LoggingConfig:
+        LogGroup: !Ref ExtractorLogGroup
+
+  ExtractorMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: HasExtractor
+    Properties:
+      EventSourceArn: !GetAtt ExtractQueue.Arn
+      FunctionName: !Ref ExtractorFunction
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: 2
+
+  # ------------------------------------------------------------------ Monitoring and cost guard
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - { Protocol: email, Endpoint: !Ref BudgetEmail }
+
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages landed in the matching dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt MatchDLQ.QueueName }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API Lambda raised errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref ApiFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  WorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Matching worker raised errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref MatchWorkerFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API Gateway returned 5xx responses
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - { Name: ApiId, Value: !Ref HttpApi }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+
+Outputs:
+  ApiUrl:
+    Description: Put in the Android BackendConfig.API_BASE_URL
+    Value: !GetAtt HttpApi.ApiEndpoint
+  Region:
+    Description: Put in BackendConfig.COGNITO_REGION
+    Value: !Ref AWS::Region
+  UserPoolClientId:
+    Description: Put in BackendConfig.COGNITO_CLIENT_ID
+    Value: !Ref UserPoolClient
+  UserPoolId:
+    Value: !Ref UserPool
+  BucketName:
+    Description: Upload the trained ml/out/weights.json to models/weights.json in this bucket
+    Value: !Ref Bucket
+  ExtractorRepositoryUri:
+    Description: Push the extractor image here (see ml/README.md)
+    Value: !GetAtt ExtractorRepository.RepositoryUri

@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ONE-TIME setup. Lets GitHub Actions deploy the Lost & Found stack with short-lived credentials (OIDC),
+  so no AWS access keys are ever stored in GitHub. Also creates the private bucket used by `cloudformation package`.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: owner/repo, e.g. akshitgupta0901/lost-and-found
+    AllowedPattern: "[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+  GitHubEnvironment:
+    Type: String
+    Default: production
+  StackName:
+    Type: String
+    Default: campus-lost-found
+    Description: The stack the pipeline will deploy; the role may only manage resources of this project.
+  CreateOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to false if this AWS account already has the token.actions.githubusercontent.com provider.
+
+Conditions:
+  MakeProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldPackages
+            Status: Enabled
+            ExpirationInDays: 30
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - MakeProvider
+                - !Ref GitHubProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                # only the production environment of THIS repository can assume the role
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubRepo}:environment:${GitHubEnvironment}"
+      Policies:
+        - PolicyName: deploy-lost-and-found
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PackageArtifacts
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: ProjectServices
+                Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - lambda:*
+                  - dynamodb:*
+                  - s3:*
+                  - sqs:*
+                  - events:*
+                  - logs:*
+                  - cognito-idp:*
+                  - apigateway:*
+                  - sns:*
+                  - cloudwatch:*
+                  - budgets:*
+                  - ecr:*
+                Resource: "*"
+              - Sid: ProjectRolesOnly
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackName}-*"
+
+Outputs:
+  DeployRoleArn:
+    Description: GitHub secret AWS_DEPLOY_ROLE_ARN
+    Value: !GetAtt DeployRole.Arn
+  ArtifactBucketName:
+    Description: GitHub variable ARTIFACT_BUCKET
+    Value: !Ref ArtifactBucket
