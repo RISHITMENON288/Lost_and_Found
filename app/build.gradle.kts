@@ -47,7 +47,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     testImplementation(libs.junit)
-    testImplementation("org.json:json:20240303") // the real org.json, because android.jar only has empty stubs for unit tests
+    testImplementation("org.json:json:20260814") // the real org.json, because android.jar only has empty stubs for unit tests
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)
