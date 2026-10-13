@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ONE-TIME setup. AWS-native CI/CD for Campus Lost & Found:
+  GitHub -> CodePipeline -> CodeBuild (test) -> CodeBuild (package) -> manual approval
+  -> CloudFormation deploy -> CodeBuild (install model + smoke test).
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: owner/repo, e.g. akshitgupta0901/LostandFound
+    AllowedPattern: "[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+  Branch:
+    Type: String
+    Default: main
+  AppStackName:
+    Type: String
+    Default: campus-lost-found
+    Description: The existing backend stack that the pipeline deploys and updates.
+  BudgetEmail:
+    Type: String
+    Description: Same value as the current backend stack. Also receives the approval request email.
+  SenderEmail:
+    Type: String
+    Default: ""
+    Description: Same value as the current backend stack.
+  AllowedEmailDomain:
+    Type: String
+    Default: ""
+    Description: Same value as the current backend stack (empty = any email).
+  ExtractorImageUri:
+    Type: String
+    Default: ""
+    Description: Same value as the current backend stack (empty = none).
+
+Resources:
+  # ------------------------------------------------------------ storage + notifications
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldBuilds
+            Status: Enabled
+            ExpirationInDays: 30
+
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - { Protocol: email, Endpoint: !Ref BudgetEmail }
+
+  # ------------------------------------------------------------ GitHub link (must be authorised once in the console)
+  GitHubConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: !Sub "${AWS::StackName}-github"
+      ProviderType: GitHub
+
+  # ------------------------------------------------------------ roles
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: "sts:AssumeRole" }
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !GetAtt PipelineBucket.Arn
+                  - !Sub "${PipelineBucket.Arn}/*"
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*"
+              # the app's data bucket is named <stack>-bucket-<random>; only the model file may be written
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${AppStackName}-bucket-*/models/*"
+
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: cloudformation.amazonaws.com }, Action: "sts:AssumeRole" }
+      Policies:
+        - PolicyName: deploy-app-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !GetAtt PipelineBucket.Arn
+                  - !Sub "${PipelineBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - lambda:*
+                  - dynamodb:*
+                  - s3:*
+                  - sqs:*
+                  - events:*
+                  - logs:*
+                  - cognito-idp:*
+                  - apigateway:*
+                  - sns:*
+                  - cloudwatch:*
+                  - budgets:*
+                  - ecr:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-*"
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codepipeline.amazonaws.com }, Action: "sts:AssumeRole" }
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetBucketVersioning, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !GetAtt PipelineBucket.Arn
+                  - !Sub "${PipelineBucket.Arn}/*"
+              - Effect: Allow
+                Action: [codestar-connections:UseConnection, codeconnections:UseConnection]
+                Resource: !Ref GitHubConnection
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource:
+                  - !GetAtt TestProject.Arn
+                  - !GetAtt PackageProject.Arn
+                  - !GetAtt VerifyProject.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ApprovalTopic
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationRole.Arn
+                Condition:
+                  StringEquals: { "iam:PassedToService": cloudformation.amazonaws.com }
+
+  # ------------------------------------------------------------ build projects (CI + packaging + verify)
+  TestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-test"
+      ServiceRole: !GetAtt BuildRole.Arn
+      TimeoutInMinutes: 15
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: cicd/buildspec-test.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+
+  PackageProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-package"
+      ServiceRole: !GetAtt BuildRole.Arn
+      TimeoutInMinutes: 15
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: cicd/buildspec-package.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: ARTIFACT_BUCKET, Type: PLAINTEXT, Value: !Ref PipelineBucket }
+
+  VerifyProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-verify"
+      ServiceRole: !GetAtt BuildRole.Arn
+      TimeoutInMinutes: 10
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: cicd/buildspec-verify.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: STACK, Type: PLAINTEXT, Value: !Ref AppStackName }
+
+  # ------------------------------------------------------------ the pipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${AWS::StackName}"
+      PipelineType: V1 # V1 = one active pipeline is free each month
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !Ref GitHubConnection
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref Branch
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: "true"
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Test
+          Actions:
+            - Name: LintTestScan
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref TestProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+        - Name: Package
+          Actions:
+            - Name: PackageTemplate
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref PackageProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: PackageOutput }]
+        - Name: Approval
+          Actions:
+            - Name: ApproveDeploy
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration:
+                NotificationArn: !Ref ApprovalTopic
+                CustomData: Tests passed. Approve to deploy the backend to AWS.
+        - Name: Deploy
+          Actions:
+            - Name: UpdateBackendStack
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: CloudFormation, Version: "1" }
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Ref AppStackName
+                TemplatePath: PackageOutput::packaged.yaml
+                Capabilities: CAPABILITY_IAM
+                RoleArn: !GetAtt CloudFormationRole.Arn
+                ParameterOverrides: !Sub |
+                  {"BudgetEmail": "${BudgetEmail}", "SenderEmail": "${SenderEmail}", "AllowedEmailDomain": "${AllowedEmailDomain}", "ExtractorImageUri": "${ExtractorImageUri}"}
+              InputArtifacts: [{ Name: PackageOutput }]
+        - Name: Verify
+          Actions:
+            - Name: ModelAndSmokeTest
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref VerifyProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+
+Outputs:
+  ConnectionArn:
+    Description: Authorise this in the console (Developer Tools -> Settings -> Connections -> Update pending connection)
+    Value: !Ref GitHubConnection
+  PipelineName:
+    Value: !Ref Pipeline
